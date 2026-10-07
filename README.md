@@ -41,7 +41,9 @@ Claude 가 점검·설정·설치를 진행하고, 아래 세 가지만 직접 �
 
 ## 운영
 
-- 업데이트: 저장소 폴더에서 `git pull && ./install.sh`
+- 업데이트: **자동**입니다. 데몬이 30분마다 이 저장소의 새 커밋을 받아, 진행 중인 리뷰가 없을 때 스스로 재시작합니다.
+  설정(`config.json`)은 그대로 둡니다. 바로 받고 싶으면 저장소 폴더에서 `git pull && ./install.sh`.
+- 저장소 폴더를 옮기거나 지우면 자동 업데이트가 멈춥니다. 옮긴 곳에서 `./install.sh` 를 다시 실행하면 됩니다.
 - 로그: `tail -f ~/.claude/slack-review/logs/relay.log`
 - 끄기: `launchctl bootout gui/$(id -u)/com.paynstore.slack-review`
 - 설정: `~/.claude/slack-review/config.json` (바꾼 뒤 `launchctl kickstart -k gui/$(id -u)/com.paynstore.slack-review`)

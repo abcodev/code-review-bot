@@ -15,6 +15,7 @@
 """
 import importlib.util
 import json
+import os
 import logging
 import queue
 import re
@@ -39,6 +40,9 @@ POSTING = Path(CONFIG_DATA.get("posting_rules", BASE / "posting.md")).expanduser
 
 APP_BOT_ID = "B0C7A354S2W"   # 공용 「코드리뷰」 앱이 남긴 메시지 표식
 POLL_SECONDS = 20
+UPDATE_SECONDS = 30 * 60
+SOURCE_FILE = BASE / "source"   # install.sh 가 남기는 원본 저장소 경로 — 없으면 자동 업데이트를 하지 않는다
+CODE_FILES = ("relay.py", "prompt.md", "schema.json", "bb.py", "posting.md")
 THREAD_POLL_EVERY = 3     # 스레드 재리뷰 확인은 1분마다
 THREAD_DAYS = 7
 
@@ -50,8 +54,12 @@ ROUND = re.compile(r"(\d+)\s*차")
 
 LIMIT = {"timeout": 90 * 60, "budget": "25"}
 TOOLS = ["Read", "Grep", "Glob", "Skill", "Agent", "Bash(git *)", "Bash(python3 *)", f"Bash({BB} *)",
-         "Bash(./gradlew *)", "Bash(./mvnw *)", "Bash(export *)", "Bash(/usr/libexec/java_home *)",
+         "Bash(./gradlew *)", "Bash(./mvnw *)", "Bash(mvn *)", "Bash(export *)", "Bash(/usr/libexec/java_home *)",
          "Bash(docker info *)", "Bash(colima status *)",
+         # 읽기 전용 셸 명령과 red-green 작업 폴더 — 누구 Mac 이든 settings.json 과 무관하게 같은 권한으로 돈다
+         "Bash(cat *)", "Bash(ls *)", "Bash(head *)", "Bash(tail *)", "Bash(wc *)", "Bash(find *)",
+         "Bash(grep *)", "Bash(rg *)", "Bash(sed -n *)", "Bash(diff *)", "Bash(jq *)",
+         "Bash(mkdir -p /private/tmp/slack-review/*)", "Bash(rm -rf /private/tmp/slack-review/*)",
          "Write(//private/tmp/slack-review/**)", "Edit(//private/tmp/slack-review/**)"]
 
 log = logging.getLogger("slack-review")
@@ -323,7 +331,7 @@ def run_claude(prompt, wt):
     result = json.loads(out.stdout)
     if result.get("is_error") or "structured_output" not in result:
         raise RuntimeError(f"claude 실패: {result.get('subtype')} {str(result.get('result'))[:200]}")
-    return result["structured_output"]
+    return {**result["structured_output"], "denied": len(result.get("permission_denials") or [])}
 
 
 # ── 답글 ───────────────────────────────────────────────────
@@ -385,9 +393,24 @@ def review(cfg, slack, state, repo, pr_id, channel=None, root=None, round_hint=N
         if res.get("posted"):
             state.rounds[key] = round_no or max(state.rounds.get(key, 1), 2)
             state.record(key, head)
-        done(reply_text(link, mode, res, round_no))
+        note = f"\n⚠️ 권한 거부 {res['denied']}건 — 일부 검증(테스트 실행 등)이 빠졌을 수 있습니다." if res["denied"] else ""
+        done(reply_text(link, mode, res, round_no) + note)
     finally:
         git(REPO_ROOT / repo, "worktree", "remove", "--force", str(wt), check=False)
+
+
+def self_update():
+    """원본 저장소에 새 커밋이 있으면 받아 코드 파일만 덮어쓴다. True 면 호출자가 끝내고 launchd 가 새 코드로 다시 띄운다."""
+    if not SOURCE_FILE.exists():
+        return False
+    src = Path(SOURCE_FILE.read_text().strip())
+    git(src, "fetch", "-q", "origin", "main")
+    if git(src, "rev-parse", "HEAD").stdout == git(src, "rev-parse", "origin/main").stdout:
+        return False
+    git(src, "pull", "-q", "--ff-only", "origin", "main")
+    for name in CODE_FILES:
+        shutil.copy2(src / name, BASE / name)
+    return True
 
 
 def handle_request(cfg, slack, state, channel, ts, links, root=None, round_hint=None):
@@ -415,16 +438,31 @@ def serve():
     cfg = load_config()
     slack = WebClient(token=keychain("slack-review-user-token"))
     me = slack.auth_test()["user_id"]
-    state, jobs, queued = State(), queue.Queue(), set()
+    state, jobs, queued, busy = State(), queue.Queue(), set(), threading.Event()
 
     def worker():
         while True:
             channel, ts, links, root, round_hint = jobs.get()
+            busy.set()
             try:
                 handle_request(cfg, slack, state, channel, ts, links, root, round_hint)
             except Exception as e:  # noqa: BLE001
                 log.exception("요청 처리 실패 %s", ts)
                 notify(f"자동 리뷰 요청 처리 실패 — {e}"[:200])
+            finally:
+                busy.clear()
+
+    def updater():
+        while True:
+            time.sleep(UPDATE_SECONDS)
+            if busy.is_set() or not jobs.empty():
+                continue  # 리뷰 중에는 바꾸지 않는다 — 다음 주기에 다시 본다
+            try:
+                if self_update():
+                    log.info("새 버전을 받아 재시작합니다")
+                    os._exit(0)  # KeepAlive 라 launchd 가 새 코드로 다시 띄운다
+            except Exception:  # noqa: BLE001 — 업데이트 실패로 리뷰를 멈추지 않는다
+                log.exception("자동 업데이트 실패")
 
     def poller():
         dms, refreshed, tick = {}, 0.0, 0
@@ -463,6 +501,7 @@ def serve():
 
     threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=poller, daemon=True).start()
+    threading.Thread(target=updater, daemon=True).start()
     socket = SocketModeClient(app_token=keychain("slack-review-app-token"), web_client=slack)
     socket.socket_mode_request_listeners.append(on_request)
     socket.connect()
