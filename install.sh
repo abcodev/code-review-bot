@@ -67,17 +67,35 @@ if grep -q '"<' "$DEST/config.json"; then
   ng "config.json 의 partners 가 비어 있습니다 — $DEST/config.json 에 요청자 Slack 멤버 ID 를 넣어 주세요"
 fi
 
+if [ "$FAIL" -eq 0 ]; then
+  # 키체인에 「있는지」가 아니라 실제로 로그인되는지 본다 — 토큰 종류가 틀리면 여기서 걸린다
+  if WHO=$(cd "$DEST" && "$DEST/.venv/bin/python" - 2>&1 <<'PY'
+import relay
+from slack_sdk import WebClient
+bb_user = relay.bb.request("GET", "/user")["display_name"]
+slack_user = WebClient(token=relay.keychain("slack-review-user-token")).auth_test()["user"]
+print(f"Bitbucket={bb_user} · Slack={slack_user}")
+PY
+  ); then
+    ok "로그인 확인 — $WHO"
+  else
+    ng "토큰으로 로그인 실패 — $(echo "$WHO" | tail -1)"
+  fi
+fi
+
 echo "3) 실행"
 if [ "$FAIL" -ne 0 ]; then
   echo "  ⏸  점검 실패 항목이 있어 데몬을 등록하지 않았습니다. 해결 후 install.sh 를 다시 실행해 주세요."
   exit 1
 fi
 cp "$DEST/$LABEL.plist" "$PLIST"
+BEFORE=$(wc -l < "$DEST/logs/relay.log" 2>/dev/null || echo 0)
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 sleep 8
-if grep -q "연결됨" "$DEST/logs/relay.log" 2>/dev/null; then
-  ok "데몬 실행 중 — $(grep "연결됨" "$DEST/logs/relay.log" | tail -1)"
+NEW_LOG=$(tail -n +$((BEFORE + 1)) "$DEST/logs/relay.log" 2>/dev/null)
+if echo "$NEW_LOG" | grep -q "연결됨"; then
+  ok "데몬 실행 중 — $(echo "$NEW_LOG" | grep "연결됨" | tail -1)"
 else
   ng "연결 로그가 없습니다 — tail -30 $DEST/logs/relay.log 확인"
 fi

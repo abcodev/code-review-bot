@@ -39,10 +39,14 @@ POSTING = Path(CONFIG_DATA.get("posting_rules", BASE / "posting.md")).expanduser
 
 APP_BOT_ID = "B0C7A354S2W"   # 공용 「코드리뷰」 앱이 남긴 메시지 표식
 POLL_SECONDS = 20
+THREAD_POLL_EVERY = 3     # 스레드 재리뷰 확인은 1분마다
+THREAD_DAYS = 7
 
 PR_LINK = re.compile(r"https://bitbucket\.org/pay-n/([\w.-]+)/pull-requests/(\d+)")
 REQUESTER = re.compile(r"^<@(U\w+)> 님 코드리뷰 요청")
 NOT_CODE = re.compile(r"/test/|\.md$|^docs/")
+RE_REVIEW = re.compile(r"재리뷰|\d+\s*차")
+ROUND = re.compile(r"(\d+)\s*차")
 
 LIMIT = {"timeout": 90 * 60, "budget": "25"}
 TOOLS = ["Read", "Grep", "Glob", "Skill", "Agent", "Bash(git *)", "Bash(python3 *)", f"Bash({BB} *)",
@@ -95,12 +99,21 @@ class State:
         self.reviewed = data.get("reviewed", {})
         self.handled = data.get("handled", [])
         self.cursor = data.get("cursor", {})
+        self.threads = data.get("threads", {})   # 요청 스레드 → {channel, links, cursor}
+        self.rounds = data.get("rounds", {})     # PR → 마지막 리뷰 회차
         self.lock = threading.Lock()
 
     def save(self):
         with self.lock:
+            cutoff = time.time() - THREAD_DAYS * 86400
+            self.threads = {ts: v for ts, v in self.threads.items() if float(ts) >= cutoff}
             STATE.write_text(json.dumps({"reviewed": self.reviewed, "handled": self.handled[-500:],
-                                         "cursor": self.cursor}, indent=1))
+                                         "cursor": self.cursor, "threads": self.threads,
+                                         "rounds": self.rounds}, indent=1))
+
+    def add_thread(self, channel, root, links):
+        self.threads.setdefault(root, {"channel": channel, "links": links, "cursor": root})
+        self.save()
 
     def reviewed_commit(self, key):
         return self.reviewed.get(key)
@@ -162,6 +175,26 @@ def new_requests(slack, state, me, partners, channel):
             continue
         links = list(dict.fromkeys((r, int(i)) for r, i in PR_LINK.findall(m["text"])))
         found.append((channel, m["ts"], links))
+    state.save()
+    return found
+
+
+def thread_requests(slack, state, me, partners):
+    """최근 요청 스레드 안에서 상대방이 「재리뷰」·「N차」로 다시 부탁한 답글."""
+    found = []
+    for root, info in list(state.threads.items()):
+        replies = slack.conversations_replies(channel=info["channel"], ts=root, oldest=info["cursor"])["messages"]
+        for m in replies:
+            if m["ts"] == root or float(m["ts"]) <= float(info["cursor"]):
+                continue
+            info["cursor"] = max(info["cursor"], m["ts"], key=float)
+            user, text = m.get("user"), m.get("text", "")
+            if m.get("bot_id") or user == me or user not in partners or m["ts"] in state.handled:
+                continue
+            if RE_REVIEW.search(text):
+                hint = ROUND.search(text)
+                links = [tuple(link) for link in info["links"]]
+                found.append((info["channel"], m["ts"], links, root, int(hint.group(1)) if hint else None))
     state.save()
     return found
 
@@ -300,25 +333,26 @@ def tally(counts):
     return " · ".join(f"{m} {counts[k]}" for m, k in marks if counts.get(k))
 
 
-def reply_text(link, mode, res):
+def reply_text(link, mode, res, round_no=None):
     if not res.get("posted"):
         return f"{link} 리뷰를 게시하지 않았습니다 — {res.get('skipped_reason', '사유 미기재')}"
     new = tally(res["counts"])
+    label = f"{round_no}차 리뷰" if round_no and round_no >= 2 else ("리뷰" if mode == "first" else "재리뷰")
     if mode == "first":
         if not new:
-            return f"{link} 리뷰 완료했습니다 — 지적 없음, PR 에 리뷰 댓글 남겼습니다.\n{res['headline']}"
-        return f"{link} 리뷰 완료했습니다 — PR 에 댓글 남겼습니다 ({new})\n{res['headline']}"
+            return f"{link} {label} 완료했습니다 — 지적 없음, PR 에 리뷰 댓글 남겼습니다.\n{res['headline']}"
+        return f"{link} {label} 완료했습니다 — PR 에 댓글 남겼습니다 ({new})\n{res['headline']}"
     p = res.get("prior") or {}
     parts = [f"이전 지적 {p.get('total', 0)}건 중 {p.get('resolved', 0)}건 반영"]
     if p.get("unresolved"):
         parts.append(f"미반영 {p['unresolved']}건")
     parts.append(f"새 지적 {new}" if new else "새 지적 없음")
-    return f"{link} 재리뷰 완료했습니다 — {' · '.join(parts)}\n{res['headline']}"
+    return f"{link} {label} 완료했습니다 — {' · '.join(parts)}\n{res['headline']}"
 
 
 # ── 작업 ───────────────────────────────────────────────────
 
-def review(cfg, slack, state, repo, pr_id, channel=None, root=None, dry=False):
+def review(cfg, slack, state, repo, pr_id, channel=None, root=None, round_hint=None, dry=False):
     key = f"{repo}#{pr_id}"
     pr = bb.request("GET", bb.pr_path(repo, pr_id))
     link = f"<{pr['links']['html']['href']}|{key}>"
@@ -347,22 +381,27 @@ def review(cfg, slack, state, repo, pr_id, channel=None, root=None, dry=False):
             return None
         log.info("리뷰 시작 %s %s (%s)", key, mode, size(rows))
         res = run_claude(prompt, wt)
+        round_no = round_hint or (state.rounds[key] + 1 if key in state.rounds else 1 if mode == "first" else None)
         if res.get("posted"):
+            state.rounds[key] = round_no or max(state.rounds.get(key, 1), 2)
             state.record(key, head)
-        done(reply_text(link, mode, res))
+        done(reply_text(link, mode, res, round_no))
     finally:
         git(REPO_ROOT / repo, "worktree", "remove", "--force", str(wt), check=False)
 
 
-def handle_request(cfg, slack, state, channel, ts, links):
+def handle_request(cfg, slack, state, channel, ts, links, root=None, round_hint=None):
+    """ts 는 👀 를 달 요청(명령 메시지 또는 스레드 재리뷰 답글), root 는 답글을 달 스레드."""
+    root = root or ts
+    state.add_thread(channel, root, links)
     react(slack, channel, ts, "eyes")
     for repo, pr_id in links:
         try:
-            review(cfg, slack, state, repo, pr_id, channel=channel, root=ts)
+            review(cfg, slack, state, repo, pr_id, channel=channel, root=root, round_hint=round_hint)
         except Exception as e:  # noqa: BLE001 — 한 PR 실패가 다른 PR 을 막지 않게 한다
             log.exception("리뷰 실패 %s#%s", repo, pr_id)
             notify(f"{repo}#{pr_id} 자동 리뷰 실패 — {e}"[:200])
-            slack.chat_postMessage(channel=channel, thread_ts=ts,
+            slack.chat_postMessage(channel=channel, thread_ts=root,
                                    text=f"<{pr_url(repo, pr_id)}|{repo}#{pr_id}> 자동 리뷰가 실패했습니다. 확인 후 다시 진행하겠습니다.")
     state.mark_handled(ts)
 
@@ -380,25 +419,29 @@ def serve():
 
     def worker():
         while True:
-            channel, ts, links = jobs.get()
+            channel, ts, links, root, round_hint = jobs.get()
             try:
-                handle_request(cfg, slack, state, channel, ts, links)
+                handle_request(cfg, slack, state, channel, ts, links, root, round_hint)
             except Exception as e:  # noqa: BLE001
                 log.exception("요청 처리 실패 %s", ts)
                 notify(f"자동 리뷰 요청 처리 실패 — {e}"[:200])
 
     def poller():
-        dms, refreshed = {}, 0.0
+        dms, refreshed, tick = {}, 0.0, 0
         while True:
             try:
                 if time.time() - refreshed > 600:
                     dms, refreshed = partner_dms(slack, cfg["partners"]), time.time()
-                for channel in dms.values():
-                    for channel_, ts, links in new_requests(slack, state, me, cfg["partners"], channel):
-                        if ts not in queued:
-                            log.info("요청 발견 %s %s", ts, links)
-                            queued.add(ts)
-                            jobs.put((channel_, ts, links))
+                found = [(c, ts, links, None, None) for channel in dms.values()
+                         for c, ts, links in new_requests(slack, state, me, cfg["partners"], channel)]
+                if tick % THREAD_POLL_EVERY == 0:
+                    found += thread_requests(slack, state, me, cfg["partners"])
+                tick += 1
+                for job in found:
+                    if job[1] not in queued:
+                        log.info("요청 발견 %s %s 스레드=%s 회차=%s", job[1], job[2], job[3], job[4])
+                        queued.add(job[1])
+                        jobs.put(job)
             except Exception:  # noqa: BLE001 — 일시적인 Slack 오류로 우편함 확인을 멈추지 않는다
                 log.exception("DM 확인 실패")
             time.sleep(POLL_SECONDS)
