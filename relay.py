@@ -12,6 +12,7 @@
 사용:
   relay.py run              # 상주 (launchd)
   relay.py dry <PR 링크>    # 재리뷰 판별·프롬프트만 출력. 실행·게시하지 않음
+  relay.py requeue [ts…]    # 데몬을 멈춘 상태에서 — 최근 24시간 상대방 요청 중 끝나지 않은 것(과 지정한 ts)을 처리 목록에 다시 넣는다
 """
 import importlib.util
 import json
@@ -53,16 +54,26 @@ RE_REVIEW = re.compile(r"재리뷰|\d+\s*차")
 ROUND = re.compile(r"(\d+)\s*차")
 
 LIMIT = {"timeout": 90 * 60, "budget": "25"}
-TOOLS = ["Read", "Grep", "Glob", "Skill", "Agent", "Bash(git *)", "Bash(python3 *)", f"Bash({BB} *)",
-         "Bash(./gradlew *)", "Bash(./mvnw *)", "Bash(mvn *)", "Bash(export *)", "Bash(/usr/libexec/java_home *)",
-         "Bash(docker info *)", "Bash(colima status *)",
-         # 읽기 전용 셸 명령과 red-green 작업 폴더 — 누구 Mac 이든 settings.json 과 무관하게 같은 권한으로 돈다
-         "Bash(cat *)", "Bash(ls *)", "Bash(head *)", "Bash(tail *)", "Bash(wc *)", "Bash(find *)",
-         "Bash(grep *)", "Bash(rg *)", "Bash(sed -n *)", "Bash(diff *)", "Bash(jq *)",
-         "Bash(mkdir -p /private/tmp/slack-review/*)", "Bash(rm -rf /private/tmp/slack-review/*)",
-         "Write(//private/tmp/slack-review/**)", "Edit(//private/tmp/slack-review/**)"]
+LIMIT_RETRY_SECONDS = 10 * 60
+USAGE_LIMIT = re.compile(r"hit your (session|weekly|monthly spend) limit", re.I)
+# 셸은 전부 허용하고 위험한 것만 막는다 — 형태별 허용 목록은 명령 조합이 끝이 없어 거부가 계속 났다(10-07).
+# 금지 목록(DENY)이 허용보다 우선한다. 파일 쓰기는 작업 폴더와 워크트리 안으로만.
+TOOLS = ["Read", "Grep", "Glob", "Skill", "Agent", "Bash", "TodoWrite", "ToolSearch",
+         "Write(//private/tmp/slack-review/**)", "Edit(//private/tmp/slack-review/**)",
+         f"Write(/{WT_ROOT}/**)", f"Edit(/{WT_ROOT}/**)"]
+DENY = ["Bash(git commit *)", "Bash(git push *)", "Bash(git merge *)", "Bash(git rebase *)",
+        "Bash(git reset --hard *)", "Bash(git tag *)",
+        "Bash(curl *)", "Bash(wget *)", "Bash(nc *)", "Bash(scp *)", "Bash(ssh *)",
+        "Bash(security *)", "Bash(sudo *)", "Bash(rm -rf /)", "Bash(rm -rf ~*)", "Bash(rm -rf /Users*)"]
 
 log = logging.getLogger("slack-review")
+_locks, _locks_guard = {}, threading.Lock()
+
+
+def named_lock(name):
+    """같은 PR 리뷰·같은 저장소 git 작업이 동시에 돌지 않게 하는 이름별 잠금."""
+    with _locks_guard:
+        return _locks.setdefault(name, threading.Lock())
 
 
 def load_bb():
@@ -109,7 +120,8 @@ class State:
         self.cursor = data.get("cursor", {})
         self.threads = data.get("threads", {})   # 요청 스레드 → {channel, links, cursor}
         self.rounds = data.get("rounds", {})     # PR → 마지막 리뷰 회차
-        self.lock = threading.Lock()
+        self.pending = data.get("pending", [])   # 발견했지만 끝나지 않은 요청 — 재시작해도 이어서 처리한다
+        self.lock = threading.RLock()  # 일꾼 여럿과 확인 스레드가 함께 고친다
 
     def save(self):
         with self.lock:
@@ -117,22 +129,32 @@ class State:
             self.threads = {ts: v for ts, v in self.threads.items() if float(ts) >= cutoff}
             STATE.write_text(json.dumps({"reviewed": self.reviewed, "handled": self.handled[-500:],
                                          "cursor": self.cursor, "threads": self.threads,
-                                         "rounds": self.rounds}, indent=1))
+                                         "rounds": self.rounds, "pending": self.pending}, indent=1))
+
+    def add_pending(self, job):
+        with self.lock:
+            self.pending.append(list(job))
+            self.save()
 
     def add_thread(self, channel, root, links):
-        self.threads.setdefault(root, {"channel": channel, "links": links, "cursor": root})
-        self.save()
+        with self.lock:
+            self.threads.setdefault(root, {"channel": channel, "links": links, "cursor": root})
+            self.save()
 
     def reviewed_commit(self, key):
         return self.reviewed.get(key)
 
-    def record(self, key, commit):
-        self.reviewed[key] = commit
-        self.save()
+    def record(self, key, commit, round_no):
+        with self.lock:
+            self.reviewed[key] = commit
+            self.rounds[key] = round_no or max(self.rounds.get(key, 1), 2)
+            self.save()
 
     def mark_handled(self, ts):
-        self.handled.append(ts)
-        self.save()
+        with self.lock:
+            self.handled.append(ts)
+            self.pending = [job for job in self.pending if job[1] != ts]
+            self.save()
 
 
 # ── 명령: 요청 메시지만 남긴다 ─────────────────────────────
@@ -169,8 +191,17 @@ def partner_dms(slack, partners):
 
 def new_requests(slack, state, me, partners, channel):
     """이 DM 에 새로 올라온, 상대방이 남긴 요청. 처음 보는 DM 은 지금부터 읽는다 — 설치 전 요청은 건드리지 않는다."""
-    oldest = state.cursor.setdefault(channel, f"{time.time():.6f}")
+    with state.lock:
+        oldest = state.cursor.setdefault(channel, f"{time.time():.6f}")
     messages = slack.conversations_history(channel=channel, oldest=oldest, limit=100)["messages"]
+    found = []
+    with state.lock:
+        found = _pick_requests(state, me, partners, channel, messages)
+        state.save()
+    return found
+
+
+def _pick_requests(state, me, partners, channel, messages):
     found = []
     for m in sorted(messages, key=lambda m: float(m["ts"])):
         state.cursor[channel] = max(state.cursor[channel], m["ts"], key=float)
@@ -183,7 +214,6 @@ def new_requests(slack, state, me, partners, channel):
             continue
         links = list(dict.fromkeys((r, int(i)) for r, i in PR_LINK.findall(m["text"])))
         found.append((channel, m["ts"], links))
-    state.save()
     return found
 
 
@@ -192,18 +222,25 @@ def thread_requests(slack, state, me, partners):
     found = []
     for root, info in list(state.threads.items()):
         replies = slack.conversations_replies(channel=info["channel"], ts=root, oldest=info["cursor"])["messages"]
-        for m in replies:
-            if m["ts"] == root or float(m["ts"]) <= float(info["cursor"]):
-                continue
-            info["cursor"] = max(info["cursor"], m["ts"], key=float)
-            user, text = m.get("user"), m.get("text", "")
-            if m.get("bot_id") or user == me or user not in partners or m["ts"] in state.handled:
-                continue
-            if RE_REVIEW.search(text):
-                hint = ROUND.search(text)
-                links = [tuple(link) for link in info["links"]]
-                found.append((info["channel"], m["ts"], links, root, int(hint.group(1)) if hint else None))
+        with state.lock:
+            found += _pick_rereviews(state, me, partners, root, info, replies)
     state.save()
+    return found
+
+
+def _pick_rereviews(state, me, partners, root, info, replies):
+    found = []
+    for m in replies:
+        if m["ts"] == root or float(m["ts"]) <= float(info["cursor"]):
+            continue
+        info["cursor"] = max(info["cursor"], m["ts"], key=float)
+        user, text = m.get("user"), m.get("text", "")
+        if m.get("bot_id") or user == me or user not in partners or m["ts"] in state.handled:
+            continue
+        if RE_REVIEW.search(text):
+            hint = ROUND.search(text)
+            links = [tuple(link) for link in info["links"]]
+            found.append((info["channel"], m["ts"], links, root, int(hint.group(1)) if hint else None))
     return found
 
 
@@ -249,6 +286,19 @@ def ensure_clone(repo):
 
 
 def prepare_worktree(repo, pr):
+    with named_lock(f"git:{repo}"), named_lock("git:payn_domain") if repo == "payn_backend" else _NO_LOCK:
+        return _prepare_worktree(repo, pr)
+
+
+class _NoLock:
+    def __enter__(self): return self
+    def __exit__(self, *exc): return False
+
+
+_NO_LOCK = _NoLock()
+
+
+def _prepare_worktree(repo, pr):
     src, dst = pr["source"], pr["destination"]
     repo_dir = ensure_clone(repo)
     wt = WT_ROOT / f"{repo}-pr{pr['id']}"
@@ -324,13 +374,16 @@ def run_claude(prompt, wt):
            "--permission-mode", "dontAsk", "--permission-prompts", "none",
            "--max-budget-usd", LIMIT["budget"],
            "--add-dir", str(HOME / ".claude"), "--add-dir", str(SCRATCH),
-           "--allowedTools", *TOOLS]
+           "--allowedTools", *TOOLS, "--disallowedTools", *DENY]
     SCRATCH.mkdir(exist_ok=True)
     out = subprocess.run(cmd, input=prompt, cwd=wt, capture_output=True, text=True, timeout=LIMIT["timeout"])
     (BASE / "logs" / f"{wt.name}-{int(time.time())}.json").write_text(out.stdout or out.stderr)
     result = json.loads(out.stdout)
     if result.get("is_error") or "structured_output" not in result:
-        raise RuntimeError(f"claude 실패: {result.get('subtype')} {str(result.get('result'))[:200]}")
+        message = str(result.get("result"))
+        if USAGE_LIMIT.search(message):
+            raise UsageLimit(message[:200])
+        raise RuntimeError(f"claude 실패: {result.get('subtype')} {message[:200]}")
     return {**result["structured_output"], "denied": len(result.get("permission_denials") or [])}
 
 
@@ -342,8 +395,8 @@ def tally(counts):
 
 
 def reply_text(link, mode, res, round_no=None):
-    if not res.get("posted"):
-        return f"{link} 리뷰를 게시하지 않았습니다 — {res.get('skipped_reason', '사유 미기재')}"
+    if not res.get("posted"):  # 내부 사유는 스레드에 쓰지 않는다 — 로그·알림으로만
+        return f"{link} 자동 리뷰를 마치지 못했습니다. 확인 후 다시 진행하겠습니다."
     new = tally(res["counts"])
     label = f"{round_no}차 리뷰" if round_no and round_no >= 2 else ("리뷰" if mode == "first" else "재리뷰")
     if mode == "first":
@@ -389,14 +442,21 @@ def review(cfg, slack, state, repo, pr_id, channel=None, root=None, round_hint=N
             return None
         log.info("리뷰 시작 %s %s (%s)", key, mode, size(rows))
         res = run_claude(prompt, wt)
+        if not res.get("posted"):
+            log.warning("게시 안 됨 — 한 번 다시 실행 %s: %s", key, res.get("skipped_reason"))
+            res = run_claude(prompt, wt)
+        if not res.get("posted"):
+            notify(f"{key} 자동 리뷰 미게시 — {res.get('skipped_reason', '')}"[:200])
         round_no = round_hint or (state.rounds[key] + 1 if key in state.rounds else 1 if mode == "first" else None)
         if res.get("posted"):
-            state.rounds[key] = round_no or max(state.rounds.get(key, 1), 2)
-            state.record(key, head)
-        note = f"\n⚠️ 권한 거부 {res['denied']}건 — 일부 검증(테스트 실행 등)이 빠졌을 수 있습니다." if res["denied"] else ""
-        done(reply_text(link, mode, res, round_no) + note)
+            state.record(key, head, round_no)
+        if res["denied"]:  # 스레드에는 올리지 않는다 — 허용 목록 보강용으로 로그만
+            log.warning("권한 거부 %d건 %s — logs/*.json 의 permission_denials 참고", res["denied"], key)
+        if res.get("posted"):  # 실패·미게시는 스레드에 올리지 않는다 — 로그·Mac 알림으로만
+            done(reply_text(link, mode, res, round_no))
     finally:
-        git(REPO_ROOT / repo, "worktree", "remove", "--force", str(wt), check=False)
+        with named_lock(f"git:{repo}"):
+            git(REPO_ROOT / repo, "worktree", "remove", "--force", str(wt), check=False)
 
 
 def self_update():
@@ -413,19 +473,27 @@ def self_update():
     return True
 
 
+class UsageLimit(RuntimeError):
+    """Claude 구독 한도 — 리뷰 실패가 아니라 나중에 다시 할 일이다."""
+
+
 def handle_request(cfg, slack, state, channel, ts, links, root=None, round_hint=None):
-    """ts 는 👀 를 달 요청(명령 메시지 또는 스레드 재리뷰 답글), root 는 답글을 달 스레드."""
+    """ts 는 👀 를 달 요청(명령 메시지 또는 스레드 재리뷰 답글), root 는 답글을 달 스레드.
+
+    한도에 걸리면 끝남으로 기록하지 않고 UsageLimit 을 올린다 — 처리 목록에 남아 나중에 다시 돈다.
+    """
     root = root or ts
     state.add_thread(channel, root, links)
     react(slack, channel, ts, "eyes")
     for repo, pr_id in links:
         try:
-            review(cfg, slack, state, repo, pr_id, channel=channel, root=root, round_hint=round_hint)
+            with named_lock(f"pr:{repo}#{pr_id}"):  # 같은 PR 은 앞 리뷰가 끝난 뒤에 — 작업 폴더가 겹친다
+                review(cfg, slack, state, repo, pr_id, channel=channel, root=root, round_hint=round_hint)
+        except UsageLimit:
+            raise
         except Exception as e:  # noqa: BLE001 — 한 PR 실패가 다른 PR 을 막지 않게 한다
             log.exception("리뷰 실패 %s#%s", repo, pr_id)
             notify(f"{repo}#{pr_id} 자동 리뷰 실패 — {e}"[:200])
-            slack.chat_postMessage(channel=channel, thread_ts=root,
-                                   text=f"<{pr_url(repo, pr_id)}|{repo}#{pr_id}> 자동 리뷰가 실패했습니다. 확인 후 다시 진행하겠습니다.")
     state.mark_handled(ts)
 
 
@@ -438,24 +506,32 @@ def serve():
     cfg = load_config()
     slack = WebClient(token=keychain("slack-review-user-token"))
     me = slack.auth_test()["user_id"]
-    state, jobs, queued, busy = State(), queue.Queue(), set(), threading.Event()
+    state, jobs, queued = State(), queue.Queue(), set()
+    active, active_lock = [0], threading.Lock()
 
     def worker():
         while True:
             channel, ts, links, root, round_hint = jobs.get()
-            busy.set()
+            with active_lock:
+                active[0] += 1
             try:
                 handle_request(cfg, slack, state, channel, ts, links, root, round_hint)
+            except UsageLimit as e:
+                log.warning("Claude 한도 — %d분 뒤 다시 시도 %s: %s", LIMIT_RETRY_SECONDS // 60, ts, e)
+                notify(f"Claude 한도로 자동 리뷰를 미룹니다 — {e}"[:200])
+                job = (channel, ts, links, root, round_hint)
+                threading.Timer(LIMIT_RETRY_SECONDS, jobs.put, args=(job,)).start()
             except Exception as e:  # noqa: BLE001
                 log.exception("요청 처리 실패 %s", ts)
                 notify(f"자동 리뷰 요청 처리 실패 — {e}"[:200])
             finally:
-                busy.clear()
+                with active_lock:
+                    active[0] -= 1
 
     def updater():
         while True:
             time.sleep(UPDATE_SECONDS)
-            if busy.is_set() or not jobs.empty():
+            if active[0] or not jobs.empty():
                 continue  # 리뷰 중에는 바꾸지 않는다 — 다음 주기에 다시 본다
             try:
                 if self_update():
@@ -479,6 +555,7 @@ def serve():
                     if job[1] not in queued:
                         log.info("요청 발견 %s %s 스레드=%s 회차=%s", job[1], job[2], job[3], job[4])
                         queued.add(job[1])
+                        state.add_pending(job)
                         jobs.put(job)
             except Exception:  # noqa: BLE001 — 일시적인 Slack 오류로 우편함 확인을 멈추지 않는다
                 log.exception("DM 확인 실패")
@@ -499,7 +576,12 @@ def serve():
             response_type="in_channel", text=request_text(req.payload["user_id"], links))
         log.info("명령 접수 %s by %s", links, req.payload.get("user_id"))
 
-    threading.Thread(target=worker, daemon=True).start()
+    for job in state.pending:  # 재시작 전에 발견했지만 끝내지 못한 요청
+        log.info("이어서 처리 %s %s", job[1], job[2])
+        queued.add(job[1])
+        jobs.put(tuple(job))
+    for _ in range(cfg.get("workers", 2)):  # 심층 리뷰는 빌드까지 돌려 무겁다 — 기본 2개
+        threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=poller, daemon=True).start()
     threading.Thread(target=updater, daemon=True).start()
     socket = SocketModeClient(app_token=keychain("slack-review-app-token"), web_client=slack)
@@ -509,12 +591,36 @@ def serve():
     threading.Event().wait()
 
 
+def requeue(hours=24, force=()):
+    """재시작으로 잃은 요청을 되살린다. 👀 가 달려 있어도 끝난 기록(handled)이 없으면 다시 넣는다.
+
+    force 에 준 요청 ts 는 이미 끝난 기록이 있어도 다시 넣는다 — 게시에 실패한 리뷰를 다시 돌릴 때.
+    """
+    from slack_sdk import WebClient
+    cfg, state = load_config(), State()
+    state.handled = [ts for ts in state.handled if ts not in force]
+    slack = WebClient(token=keychain("slack-review-user-token"))
+    me, pending = slack.auth_test()["user_id"], {job[1] for job in state.pending}
+    for channel in partner_dms(slack, cfg["partners"]).values():
+        history = slack.conversations_history(channel=channel, oldest=str(time.time() - hours * 3600), limit=200)
+        for m in history["messages"]:
+            requester = REQUESTER.match(m.get("text", ""))
+            if m.get("bot_id") != APP_BOT_ID or not requester or requester.group(1) in (me,) \
+                    or requester.group(1) not in cfg["partners"] or m["ts"] in state.handled or m["ts"] in pending:
+                continue
+            links = list(dict.fromkeys((r, int(i)) for r, i in PR_LINK.findall(m["text"])))
+            state.add_pending((channel, m["ts"], links, None, None))
+            print("다시 넣음", m["ts"], links)
+
+
 def main():
     (BASE / "logs").mkdir(exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
     if cmd == "run":
         serve()
+    elif cmd == "requeue":
+        requeue(force=tuple(sys.argv[2:]))
     elif cmd == "dry" and len(sys.argv) > 2 and PR_LINK.search(sys.argv[2]):
         repo, pr_id = PR_LINK.search(sys.argv[2]).groups()
         review(load_config(), None, State(), repo, int(pr_id), dry=True)

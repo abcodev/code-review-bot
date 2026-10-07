@@ -46,6 +46,7 @@ Claude 가 점검·설정·설치를 진행하고, 아래 세 가지만 직접 �
 - 저장소 폴더를 옮기거나 지우면 자동 업데이트가 멈춥니다. 옮긴 곳에서 `./install.sh` 를 다시 실행하면 됩니다.
 - 로그: `tail -f ~/.claude/slack-review/logs/relay.log`
 - 끄기: `launchctl bootout gui/$(id -u)/com.paynstore.slack-review`
+- 동시 리뷰: 기본 2개까지 동시에 돕니다(같은 PR 은 순서대로). 바꾸려면 설정에 `"workers": 3` 처럼 넣습니다.
 - 설정: `~/.claude/slack-review/config.json` (바꾼 뒤 `launchctl kickstart -k gui/$(id -u)/com.paynstore.slack-review`)
 
 ---
