@@ -1,0 +1,5 @@
+{
+  "partners": ["<요청자 Slack 멤버 ID, 예: U0XXXXXXXXX>"],
+  "repos": ["pos_backend", "payn_backend", "payn_domain", "payin_backend"],
+  "review_command": ""
+}

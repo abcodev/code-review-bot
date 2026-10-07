@@ -1,0 +1,30 @@
+{
+  "type": "object",
+  "properties": {
+    "posted": {"type": "boolean", "description": "리뷰를 끝까지 수행했으면 true(지적 0건 포함). 상태 변경 등으로 중단하면 false"},
+    "rereview": {"type": "boolean"},
+    "counts": {
+      "type": "object",
+      "properties": {
+        "red": {"type": "integer"},
+        "yellow": {"type": "integer"},
+        "green": {"type": "integer"},
+        "question": {"type": "integer"}
+      },
+      "required": ["red", "yellow", "green", "question"]
+    },
+    "prior": {
+      "type": "object",
+      "description": "재리뷰일 때만. 이전 지적 수와 반영 여부",
+      "properties": {
+        "total": {"type": "integer"},
+        "resolved": {"type": "integer"},
+        "unresolved": {"type": "integer"}
+      },
+      "required": ["total", "resolved", "unresolved"]
+    },
+    "headline": {"type": "string", "description": "슬랙 답글용 한 줄 요약, 60자 이내 존댓말"},
+    "skipped_reason": {"type": "string"}
+  },
+  "required": ["posted", "rereview", "counts", "headline"]
+}
