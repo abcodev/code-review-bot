@@ -72,6 +72,9 @@ if [ "$FAIL" -eq 0 ]; then
   if WHO=$(cd "$DEST" && "$DEST/.venv/bin/python" - 2>&1 <<'PY'
 import relay
 from slack_sdk import WebClient
+for service, prefix in (("slack-review-user-token", "xoxp-"), ("slack-review-app-token", "xapp-")):
+    if not relay.keychain(service).startswith(prefix):
+        raise SystemExit(f"{service} 자리에 {prefix} 가 아닌 토큰이 들어 있습니다 — 사용자 토큰은 xoxp-, 앱 토큰은 xapp- 입니다")
 bb_user = relay.bb.request("GET", "/user")["display_name"]
 slack_user = WebClient(token=relay.keychain("slack-review-user-token")).auth_test()["user"]
 print(f"Bitbucket={bb_user} · Slack={slack_user}")
