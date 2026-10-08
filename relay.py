@@ -50,7 +50,7 @@ THREAD_DAYS = 7
 PR_LINK = re.compile(r"https://bitbucket\.org/pay-n/([\w.-]+)/pull-requests/(\d+)")
 REQUESTER = re.compile(r"^<@(U\w+)> 님 코드리뷰 요청")
 NOT_CODE = re.compile(r"/test/|\.md$|^docs/")
-RE_REVIEW = re.compile(r"재리뷰|\d+\s*차")
+RE_REVIEW = re.compile(r"리뷰|\d+\s*차")  # 요청 스레드 안 상대방 답글에 「리뷰」가 있으면 다시 돈다(10-07)
 ROUND = re.compile(r"(\d+)\s*차")
 
 LIMIT = {"timeout": 90 * 60, "budget": "25"}
@@ -348,6 +348,11 @@ MODE_TEXT = {
                  "PR 전체 diff(`origin/{dst}...HEAD`)에 있는 파일만이다 — 나머지는 타깃 동기화로 들어온 변경이다."),
     "base_lost": ("재리뷰다. 기준 커밋 `{base}` 이 사라졌다(강제 푸시 추정). 리뷰 범위는 "
                   "`git diff origin/{dst}...HEAD` 전체지만, 이전 지적과 겹치는 지적은 새로 달지 않는다."),
+    "discussion": ("재리뷰 요청이지만 지난 리뷰(`{base}`) 이후 새 커밋은 없다. 코드 대신 **지난 리뷰 이후 PR 에 달린 댓글·답글**을 본다. "
+                   "작성자나 다른 사람이 이 계정의 지적에 반박·설명·질문을 남겼으면 코드로 확인해 그 댓글에 답글로 답한다 — "
+                   "맞으면 「확인했습니다, 이 지적은 철회합니다」처럼 수긍하고, 아니면 근거(파일:라인)를 보강한다. "
+                   "새 코드 지적은 하지 않는다. 답할 댓글이 없으면 아무것도 게시하지 않고 posted=true, counts 전부 0, "
+                   "headline 은 「새 커밋·새 의견이 없어 기존 리뷰를 유지합니다」."),
 }
 
 
@@ -403,6 +408,8 @@ def reply_text(link, mode, res, round_no=None):
         if not new:
             return f"{link} {label} 완료했습니다 — 지적 없음, PR 에 리뷰 댓글 남겼습니다.\n{res['headline']}"
         return f"{link} {label} 완료했습니다 — PR 에 댓글 남겼습니다 ({new})\n{res['headline']}"
+    if mode == "discussion":
+        return f"{link} {label} 완료했습니다 — 새 커밋이 없어 PR 의견에 답했습니다\n{res['headline']}"
     p = res.get("prior") or {}
     parts = [f"이전 지적 {p.get('total', 0)}건 중 {p.get('resolved', 0)}건 반영"]
     if p.get("unresolved"):
@@ -430,12 +437,13 @@ def review(cfg, slack, state, repo, pr_id, channel=None, root=None, round_hint=N
     if pr["state"] != "OPEN":
         return done(f"{link} PR 이 {pr['state']} 상태라 리뷰하지 않았습니다.")
     base = review_base(state, key, repo, pr_id, my_review_comments(repo, pr_id))
-    if same_commit(base, head):
-        return done(f"{link} 지난 리뷰 이후 새 커밋이 없습니다.")
 
     wt = prepare_worktree(repo, pr)
     try:
-        mode, rows = scope(wt, pr["destination"]["branch"]["name"], base)
+        if same_commit(base, head):  # 새 커밋이 없어도 재리뷰 요청이면 PR 댓글 반박·설명에 답한다
+            mode, rows = "discussion", []
+        else:
+            mode, rows = scope(wt, pr["destination"]["branch"]["name"], base)
         prompt = build_prompt(cfg, repo, pr, mode, base, size(rows))
         if dry:
             print(f"[{pr['state']}] mode={mode} base={base} ({size(rows)})\n\n{prompt}")
