@@ -49,6 +49,9 @@ THREAD_DAYS = 7
 
 PR_LINK = re.compile(r"https://bitbucket\.org/pay-n/([\w.-]+)/pull-requests/(\d+)")
 REQUESTER = re.compile(r"^<@(U\w+)> 님 코드리뷰 요청")
+REVIEWERS = re.compile(r"→ ((?:<@U\w+>\s*)+)")
+MENTION = re.compile(r"<@(U\w+)(?:\|[^>]*)?>")
+DEFAULT_CHANNELS = ["C0C99HSN5RD"]   # 코드리뷰 채널 — 명령은 아무 Mac 으로나 가므로 설정이 아니라 코드 기본값으로 맞춘다
 NOT_CODE = re.compile(r"/test/|\.md$|^docs/")
 RE_REVIEW = re.compile(r"리뷰|\d+\s*차")  # 요청 스레드 안 상대방 답글에 「리뷰」가 있으면 다시 돈다(10-07)
 ROUND = re.compile(r"(\d+)\s*차")
@@ -90,6 +93,7 @@ def load_config():
     cfg = json.loads(CONFIG.read_text())
     cfg["partners"] = set(cfg["partners"])
     cfg["repos"] = set(cfg["repos"])
+    cfg["channels"] = set(cfg.get("channels", DEFAULT_CHANNELS))
     return cfg
 
 
@@ -159,22 +163,26 @@ class State:
 
 # ── 명령: 요청 메시지만 남긴다 ─────────────────────────────
 
-def parse_command(payload):
-    """(PR 목록, 거절 사유). 거절 사유는 명령 친 사람에게만 보인다."""
-    if not payload.get("channel_id", "").startswith("D"):
-        return [], "리뷰어와의 1:1 DM 에서 요청해 주세요."
-    links = list(dict.fromkeys((r, int(i)) for r, i in PR_LINK.findall(payload.get("text", ""))))
+def parse_command(payload, channels):
+    """(PR 목록, 지정 리뷰어, 거절 사유). 거절 사유는 명령 친 사람에게만 보인다."""
+    channel = payload.get("channel_id", "")
+    if not (channel.startswith("D") or channel in channels):
+        return [], [], "리뷰어와의 1:1 DM 이나 코드리뷰 채널에서 요청해 주세요."
+    text = payload.get("text", "")
+    links = list(dict.fromkeys((r, int(i)) for r, i in PR_LINK.findall(text)))
     if not links:
-        return [], "사용법: `/코드리뷰 https://bitbucket.org/pay-n/<저장소>/pull-requests/<번호>`"
-    return links, None
+        return [], [], "사용법: `/코드리뷰 [@리뷰어] https://bitbucket.org/pay-n/<저장소>/pull-requests/<번호>`"
+    reviewers = [u for u in dict.fromkeys(MENTION.findall(text)) if u != payload.get("user_id")]
+    return links, reviewers, None
 
 
 def pr_url(repo, pr_id):
     return f"https://bitbucket.org/pay-n/{repo}/pull-requests/{pr_id}"
 
 
-def request_text(user, links):
-    return f"<@{user}> 님 코드리뷰 요청 — " + " ".join(f"<{pr_url(r, i)}|{r}#{i}>" for r, i in links)
+def request_text(user, links, reviewers=()):
+    to = (" → " + " ".join(f"<@{r}>" for r in reviewers)) if reviewers else ""
+    return f"<@{user}> 님 코드리뷰 요청{to} — " + " ".join(f"<{pr_url(r, i)}|{r}#{i}>" for r, i in links)
 
 
 # ── 우편함: 상대방 요청 찾기 ───────────────────────────────
@@ -212,6 +220,9 @@ def _pick_requests(state, me, partners, channel, messages):
         mine = any(r["name"] == "eyes" and me in r.get("users", []) for r in m.get("reactions", []))
         if user == me or user not in partners or mine or m["ts"] in state.handled:
             continue
+        named = REVIEWERS.search(m["text"])
+        if named and me not in MENTION.findall(named.group(1)):
+            continue  # 리뷰어를 지정한 요청인데 내가 아니다
         links = list(dict.fromkeys((r, int(i)) for r, i in PR_LINK.findall(m["text"])))
         found.append((channel, m["ts"], links))
     return found
@@ -554,7 +565,7 @@ def serve():
             try:
                 if time.time() - refreshed > 600:
                     dms, refreshed = partner_dms(slack, cfg["partners"]), time.time()
-                found = [(c, ts, links, None, None) for channel in dms.values()
+                found = [(c, ts, links, None, None) for channel in [*dms.values(), *cfg["channels"]]
                          for c, ts, links in new_requests(slack, state, me, cfg["partners"], channel)]
                 if tick % THREAD_POLL_EVERY == 0:
                     found += thread_requests(slack, state, me, cfg["partners"])
@@ -573,7 +584,7 @@ def serve():
         if req.type != "slash_commands":
             client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
             return
-        links, refusal = parse_command(req.payload)
+        links, reviewers, refusal = parse_command(req.payload, cfg["channels"])
         if refusal:
             client.send_socket_mode_response(SocketModeResponse(
                 envelope_id=req.envelope_id, payload={"response_type": "ephemeral", "text": refusal}))
@@ -581,8 +592,8 @@ def serve():
         # 즉시 응답을 in_channel 로 보내면 「/코드리뷰 링크」 명령 줄까지 DM 에 남는다 — 빈 응답 후 따로 보낸다
         client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
         WebhookClient(req.payload["response_url"]).send(
-            response_type="in_channel", text=request_text(req.payload["user_id"], links))
-        log.info("명령 접수 %s by %s", links, req.payload.get("user_id"))
+            response_type="in_channel", text=request_text(req.payload["user_id"], links, reviewers))
+        log.info("명령 접수 %s by %s → %s", links, req.payload.get("user_id"), reviewers or "상대방")
 
     for job in state.pending:  # 재시작 전에 발견했지만 끝내지 못한 요청
         log.info("이어서 처리 %s %s", job[1], job[2])
@@ -609,12 +620,15 @@ def requeue(hours=24, force=()):
     state.handled = [ts for ts in state.handled if ts not in force]
     slack = WebClient(token=keychain("slack-review-user-token"))
     me, pending = slack.auth_test()["user_id"], {job[1] for job in state.pending}
-    for channel in partner_dms(slack, cfg["partners"]).values():
+    for channel in [*partner_dms(slack, cfg["partners"]).values(), *cfg["channels"]]:
         history = slack.conversations_history(channel=channel, oldest=str(time.time() - hours * 3600), limit=200)
         for m in history["messages"]:
             requester = REQUESTER.match(m.get("text", ""))
             if m.get("bot_id") != APP_BOT_ID or not requester or requester.group(1) in (me,) \
                     or requester.group(1) not in cfg["partners"] or m["ts"] in state.handled or m["ts"] in pending:
+                continue
+            named = REVIEWERS.search(m["text"])
+            if named and me not in MENTION.findall(named.group(1)):
                 continue
             links = list(dict.fromkeys((r, int(i)) for r, i in PR_LINK.findall(m["text"])))
             state.add_pending((channel, m["ts"], links, None, None))
