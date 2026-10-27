@@ -22,6 +22,7 @@ import logging
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -57,6 +58,8 @@ DEFAULT_CHANNELS = ["C0C99HSN5RD"]   # 코드리뷰 채널 — 명령은 아무 
 NOT_CODE = re.compile(r"/test/|\.md$|^docs/")
 RE_REVIEW = re.compile(r"리뷰|\d+\s*차")  # 요청 스레드 안 상대방 답글에 「리뷰」가 있으면 다시 돈다(10-07)
 ROUND = re.compile(r"(\d+)\s*차")
+CANCEL_TEXT = re.compile(r"취소|중지")            # 재리뷰(「리뷰」)보다 먼저 본다 — 「리뷰 취소」는 취소다
+CANCEL_REACTIONS = {"x", "heavy_multiplication_x", "negative_squared_cross_mark"}
 
 LIMIT = {"timeout": 90 * 60, "budget": "25"}
 LIMIT_RETRY_SECONDS = 10 * 60
@@ -81,6 +84,38 @@ DENY = ["Bash(git commit *)", "Bash(git push *)", "Bash(git merge *)", "Bash(git
         "Bash(security *)", "Bash(sudo *)", "Bash(rm -rf /)", "Bash(rm -rf ~*)", "Bash(rm -rf /Users*)"]
 
 log = logging.getLogger("slack-review")
+_job = threading.local()          # 이 일꾼이 지금 처리 중인 요청 ts
+RUNNING, CANCELLED = {}, set()    # 요청 ts → 실행 중인 리뷰 프로세스 / 취소된 요청 ts
+
+
+class Cancelled(RuntimeError):
+    """요청자나 리뷰어가 취소한 리뷰 — 실패가 아니라 조용히 멈춘다."""
+
+
+def run_proc(cmd, prompt, cwd=None):
+    """취소되면 끊을 수 있게 새 프로세스 그룹으로 돌린다 — 에이전트·테스트 자식까지 함께 끊긴다."""
+    ts = getattr(_job, "ts", None)
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, cwd=cwd, start_new_session=True)
+    if ts:
+        RUNNING[ts] = proc
+    try:
+        out, err = proc.communicate(prompt, timeout=LIMIT["timeout"])
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        out, err = proc.communicate()
+    finally:
+        RUNNING.pop(ts, None)
+    if ts in CANCELLED:
+        raise Cancelled(ts)
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def cancel(ts):
+    CANCELLED.add(ts)
+    proc = RUNNING.get(ts)
+    if proc and proc.poll() is None:
+        os.killpg(proc.pid, signal.SIGTERM)
 _locks, _locks_guard = {}, threading.Lock()
 
 
@@ -240,30 +275,48 @@ def _pick_requests(state, me, partners, channel, messages):
 
 
 def thread_requests(slack, state, me, partners):
-    """최근 요청 스레드 안에서 상대방이 「재리뷰」·「N차」로 다시 부탁한 답글."""
-    found = []
+    """최근 요청 스레드 안의 답글 — (재리뷰 요청, 「취소」 가 달린 스레드)."""
+    found, cancels = [], []
     for root, info in list(state.threads.items()):
         replies = slack.conversations_replies(channel=info["channel"], ts=root, oldest=info["cursor"])["messages"]
         with state.lock:
-            found += _pick_rereviews(state, me, partners, root, info, replies)
+            picked, cancelled = _pick_rereviews(state, me, partners, root, info, replies)
+            found += picked
+            cancels += cancelled
     state.save()
-    return found
+    return found, cancels
 
 
 def _pick_rereviews(state, me, partners, root, info, replies):
-    found = []
+    found, cancels = [], []
     for m in replies:
         if m["ts"] == root or float(m["ts"]) <= float(info["cursor"]):
             continue
         info["cursor"] = max(info["cursor"], m["ts"], key=float)
         user, text = m.get("user"), m.get("text", "")
-        if m.get("bot_id") or user == me or user not in partners or m["ts"] in state.handled:
+        if m.get("bot_id") or m["ts"] in state.handled:
+            continue
+        if CANCEL_TEXT.search(text) and (user == me or user in partners):
+            cancels.append(root)
+            continue
+        if user == me or user not in partners:
             continue
         if RE_REVIEW.search(text):
             hint = ROUND.search(text)
             links = [tuple(link) for link in info["links"]]
             found.append((info["channel"], m["ts"], links, root, int(hint.group(1)) if hint else None))
-    return found
+    return found, cancels
+
+
+def cancel_marked(slack, job, allowed):
+    """처리 목록의 요청 메시지(또는 재리뷰 답글)에 요청자·리뷰어가 ❌ 를 달았는가."""
+    channel, ts, _, root, _ = job
+    if root:
+        msgs = slack.conversations_replies(channel=channel, ts=root, oldest=ts, latest=ts, inclusive=True)["messages"]
+    else:
+        msgs = slack.conversations_history(channel=channel, oldest=ts, latest=ts, inclusive=True, limit=1)["messages"]
+    target = next((m for m in msgs if m["ts"] == ts), {})
+    return any(r["name"] in CANCEL_REACTIONS and allowed & set(r.get("users", [])) for r in target.get("reactions", []))
 
 
 def react(slack, channel, ts, name):
@@ -418,7 +471,7 @@ def run_codex(prompt, wt, model=None):
            "--add-dir", str(SCRATCH), "--output-schema", str(BASE / "schema.codex.json"), "-o", str(out_file)]
     if model:
         cmd += ["-m", model]
-    out = subprocess.run(cmd + ["-"], input=prompt, capture_output=True, text=True, timeout=LIMIT["timeout"])
+    out = run_proc(cmd + ["-"], prompt)
     (BASE / "logs" / f"{wt.name}-codex-{int(time.time())}.log").write_text(out.stdout + "\n--- stderr\n" + out.stderr)
     if out.returncode != 0 or not out_file.exists():
         message = (out.stderr or out.stdout)[-400:]
@@ -441,7 +494,7 @@ def run_claude(prompt, wt, model=None):
     if model:
         cmd += ["--model", model]
     SCRATCH.mkdir(exist_ok=True)
-    out = subprocess.run(cmd, input=prompt, cwd=wt, capture_output=True, text=True, timeout=LIMIT["timeout"])
+    out = run_proc(cmd, prompt, cwd=wt)
     (BASE / "logs" / f"{wt.name}-{int(time.time())}.json").write_text(out.stdout or out.stderr)
     result = json.loads(out.stdout)
     if result.get("is_error") or "structured_output" not in result:
@@ -551,15 +604,23 @@ def handle_request(cfg, slack, state, channel, ts, links, root=None, round_hint=
 
     한도에 걸리면 끝남으로 기록하지 않고 UsageLimit 을 올린다 — 처리 목록에 남아 나중에 다시 돈다.
     """
+    _job.ts = ts
+    if ts in CANCELLED:
+        return state.mark_handled(ts)
     root = root or ts
     state.add_thread(channel, root, links)
     react(slack, channel, ts, "eyes")
     for repo, pr_id in links:
+        if ts in CANCELLED:
+            break
         try:
             with named_lock(f"pr:{repo}#{pr_id}"):  # 같은 PR 은 앞 리뷰가 끝난 뒤에 — 작업 폴더가 겹친다
                 review(cfg, slack, state, repo, pr_id, channel=channel, root=root, round_hint=round_hint)
         except UsageLimit:
             raise
+        except Cancelled:
+            log.info("리뷰 취소됨 %s#%s", repo, pr_id)
+            break
         except Exception as e:  # noqa: BLE001 — 한 PR 실패가 다른 PR 을 막지 않게 한다
             log.exception("리뷰 실패 %s#%s", repo, pr_id)
             notify(f"{repo}#{pr_id} 자동 리뷰 실패 — {e}"[:200])
@@ -617,9 +678,23 @@ def serve():
                     dms, refreshed = partner_dms(slack, cfg["partners"]), time.time()
                 found = [(c, ts, links, None, None) for channel in [*dms.values(), *cfg["channels"]]
                          for c, ts, links in new_requests(slack, state, me, cfg["partners"], channel)]
+                cancel_roots = []
                 if tick % THREAD_POLL_EVERY == 0:
-                    found += thread_requests(slack, state, me, cfg["partners"])
+                    rereviews, cancel_roots = thread_requests(slack, state, me, cfg["partners"])
+                    found += rereviews
                 tick += 1
+                allowed = set(cfg["partners"]) | {me}
+                for job in list(state.pending):
+                    if job[1] in CANCELLED:
+                        continue
+                    if (job[3] or job[1]) in cancel_roots or job[1] in cancel_roots or cancel_marked(slack, job, allowed):
+                        log.info("취소 요청 %s %s", job[1], job[2])
+                        cancel(job[1])
+                        state.mark_handled(job[1])
+                        try:
+                            slack.reactions_remove(channel=job[0], timestamp=job[1], name="eyes")
+                        except Exception:  # noqa: BLE001 — 👀 가 아직 없으면 그만
+                            pass
                 for job in found:
                     if job[1] not in queued:
                         log.info("요청 발견 %s %s 스레드=%s 회차=%s", job[1], job[2], job[3], job[4])
