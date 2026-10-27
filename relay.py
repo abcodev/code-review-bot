@@ -12,6 +12,7 @@
 사용:
   relay.py run              # 상주 (launchd)
   relay.py dry <PR 링크>    # 재리뷰 판별·프롬프트만 출력. 실행·게시하지 않음
+  relay.py engine [claude|codex] [모델|default]   # 리뷰 엔진·모델 확인/변경. 재시작 없이 다음 리뷰부터
   relay.py requeue [ts…]    # 데몬을 멈춘 상태에서 — 최근 24시간 상대방 요청 중 끝나지 않은 것(과 지정한 ts)을 처리 목록에 다시 넣는다
 """
 import importlib.util
@@ -35,6 +36,7 @@ STATE = BASE / "state.json"
 CONFIG = BASE / "config.json"
 SCRATCH = Path("/private/tmp/slack-review")
 CLAUDE = Path(shutil.which("claude") or HOME / ".local/bin/claude")
+CODEX = Path(shutil.which("codex") or HOME / ".local/bin/codex")
 CONFIG_DATA = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
 BB = Path(CONFIG_DATA.get("bb", BASE / "bb.py")).expanduser()
 POSTING = Path(CONFIG_DATA.get("posting_rules", BASE / "posting.md")).expanduser()
@@ -43,7 +45,7 @@ APP_BOT_ID = "B0C7A354S2W"   # 공용 「코드리뷰」 앱이 남긴 메시지
 POLL_SECONDS = 20
 UPDATE_SECONDS = 30 * 60
 SOURCE_FILE = BASE / "source"   # install.sh 가 남기는 원본 저장소 경로 — 없으면 자동 업데이트를 하지 않는다
-CODE_FILES = ("relay.py", "prompt.md", "schema.json", "bb.py", "posting.md")
+CODE_FILES = ("relay.py", "prompt.md", "schema.json", "schema.codex.json", "bb.py", "posting.md")
 THREAD_POLL_EVERY = 3     # 스레드 재리뷰 확인은 1분마다
 THREAD_DAYS = 7
 
@@ -58,7 +60,16 @@ ROUND = re.compile(r"(\d+)\s*차")
 
 LIMIT = {"timeout": 90 * 60, "budget": "25"}
 LIMIT_RETRY_SECONDS = 10 * 60
-USAGE_LIMIT = re.compile(r"hit your (session|weekly|monthly spend) limit", re.I)
+USAGE_LIMIT = re.compile(r"hit your (session|weekly|monthly spend|usage) limit|usage limit|rate limit", re.I)
+ENGINES = ("claude", "codex")
+ENGINE_RULES = {
+    "claude": ("- 셸 명령은 자유롭게 쓴다. 다만 git commit·push·merge·rebase·reset --hard·tag, curl·wget·ssh 같은 외부 전송, security·sudo 는 막혀 있다.\n"
+               "- **에이전트는 반드시 `run_in_background: false` 로 띄운다.** 무인 실행이라 결과를 기다리며 차례를 끝내면 그 즉시 최종 응답이 강제되고, "
+               "백그라운드 에이전트 결과는 버려진다. 여러 관점을 병렬로 돌리려면 한 응답 안에서 Agent 호출을 여러 개 동시에 하되 전부 foreground 로 한다.\n"
+               "- 모든 에이전트 결과를 받은 뒤에만 게시한다. 일부 결과로 먼저 게시하고 나중에 덧붙이지 않는다."),
+    "codex": ("- 셸 명령은 쓰되 git commit·push·merge·rebase·reset --hard·tag, curl·wget·ssh 같은 외부 전송, security·sudo 는 쓰지 않는다.\n"
+              "- 정확성·보안·트랜잭션·설계 관점을 차례로 직접 검토하고, 다 본 뒤에 한 번에 게시한다."),
+}
 # 셸은 전부 허용하고 위험한 것만 막는다 — 형태별 허용 목록은 명령 조합이 끝이 없어 거부가 계속 났다(10-07).
 # 금지 목록(DENY)이 허용보다 우선한다. 파일 쓰기는 작업 폴더와 워크트리 안으로만.
 TOOLS = ["Read", "Grep", "Glob", "Skill", "Agent", "Bash", "TodoWrite", "ToolSearch",
@@ -375,22 +386,60 @@ def review_rule(cfg):
             "정확성·보안·트랜잭션·설계를 보고, 근거는 파일:라인으로 댄다.")
 
 
+def engine_of(cfg):
+    """리뷰할 때마다 설정 파일을 다시 읽는다 — `relay.py engine` 으로 바꾸면 재시작 없이 다음 리뷰부터 적용된다."""
+    fresh = json.loads(CONFIG.read_text()) if CONFIG.exists() else cfg
+    engine = fresh.get("engine", "claude")
+    return (engine if engine in ENGINES else "claude"), fresh.get("model")
+
+
 def build_prompt(cfg, repo, pr, mode, base, why):
     dst = pr["destination"]["branch"]["name"]
     return (BASE / "prompt.md").read_text().format(
         url=pr["links"]["html"]["href"], repo=repo, pr_id=pr["id"], title=pr["title"],
         src_branch=pr["source"]["branch"]["name"], src_commit=pr["source"]["commit"]["hash"],
         dst_branch=dst, why=why, bb=BB, posting=POSTING, scratch=SCRATCH, review_rule=review_rule(cfg),
+        engine_rules=ENGINE_RULES[engine_of(cfg)[0]],
         mode=MODE_TEXT[mode].format(base=base, dst=dst))
 
 
-def run_claude(prompt, wt):
+def run_engine(cfg, prompt, wt):
+    engine, model = engine_of(cfg)
+    res = run_codex(prompt, wt, model) if engine == "codex" else run_claude(prompt, wt, model)
+    return {**res, "engine": engine}
+
+
+def run_codex(prompt, wt, model=None):
+    """Codex 는 작업 폴더 쓰기 + 네트워크만 연 샌드박스로 돈다 — 명령별 금지 기능이 없어 샌드박스를 끄지 않는다."""
+    SCRATCH.mkdir(exist_ok=True)
+    out_file = SCRATCH / f"codex-{wt.name}-{int(time.time())}.json"
+    cmd = [str(CODEX), "exec", "--skip-git-repo-check", "-C", str(wt),
+           "-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true",
+           "--add-dir", str(SCRATCH), "--output-schema", str(BASE / "schema.codex.json"), "-o", str(out_file)]
+    if model:
+        cmd += ["-m", model]
+    out = subprocess.run(cmd + ["-"], input=prompt, capture_output=True, text=True, timeout=LIMIT["timeout"])
+    (BASE / "logs" / f"{wt.name}-codex-{int(time.time())}.log").write_text(out.stdout + "\n--- stderr\n" + out.stderr)
+    if out.returncode != 0 or not out_file.exists():
+        message = (out.stderr or out.stdout)[-400:]
+        if USAGE_LIMIT.search(message):
+            raise UsageLimit(message[:200])
+        raise RuntimeError(f"codex 실패: exit {out.returncode} {message[:200]}")
+    res = json.loads(out_file.read_text())
+    if not (res.get("prior") or {}).get("total"):
+        res.pop("prior", None)
+    return {**res, "denied": 0}
+
+
+def run_claude(prompt, wt, model=None):
     cmd = [str(CLAUDE), "-p", "--output-format", "json",
            "--json-schema", (BASE / "schema.json").read_text(),
            "--permission-mode", "dontAsk", "--permission-prompts", "none",
            "--max-budget-usd", LIMIT["budget"],
            "--add-dir", str(HOME / ".claude"), "--add-dir", str(SCRATCH),
            "--allowedTools", *TOOLS, "--disallowedTools", *DENY]
+    if model:
+        cmd += ["--model", model]
     SCRATCH.mkdir(exist_ok=True)
     out = subprocess.run(cmd, input=prompt, cwd=wt, capture_output=True, text=True, timeout=LIMIT["timeout"])
     (BASE / "logs" / f"{wt.name}-{int(time.time())}.json").write_text(out.stdout or out.stderr)
@@ -460,10 +509,10 @@ def review(cfg, slack, state, repo, pr_id, channel=None, root=None, round_hint=N
             print(f"[{pr['state']}] mode={mode} base={base} ({size(rows)})\n\n{prompt}")
             return None
         log.info("리뷰 시작 %s %s (%s)", key, mode, size(rows))
-        res = run_claude(prompt, wt)
+        res = run_engine(cfg, prompt, wt)
         if not res.get("posted"):
             log.warning("게시 안 됨 — 한 번 다시 실행 %s: %s", key, res.get("skipped_reason"))
-            res = run_claude(prompt, wt)
+            res = run_engine(cfg, prompt, wt)
         if not res.get("posted"):
             notify(f"{key} 자동 리뷰 미게시 — {res.get('skipped_reason', '')}"[:200])
         round_no = round_hint or (state.rounds[key] + 1 if key in state.rounds else 1 if mode == "first" else None)
@@ -472,7 +521,8 @@ def review(cfg, slack, state, repo, pr_id, channel=None, root=None, round_hint=N
         if res["denied"]:  # 스레드에는 올리지 않는다 — 허용 목록 보강용으로 로그만
             log.warning("권한 거부 %d건 %s — logs/*.json 의 permission_denials 참고", res["denied"], key)
         if res.get("posted"):  # 실패·미게시는 스레드에 올리지 않는다 — 로그·Mac 알림으로만
-            done(reply_text(link, mode, res, round_no))
+            text = reply_text(link, mode, res, round_no)
+            done(text.replace("완료했습니다", "완료했습니다 (Codex)", 1) if res.get("engine") == "codex" else text)
     finally:
         with named_lock(f"git:{repo}"):
             git(REPO_ROOT / repo, "worktree", "remove", "--force", str(wt), check=False)
@@ -635,12 +685,34 @@ def requeue(hours=24, force=()):
             print("다시 넣음", m["ts"], links)
 
 
+def set_engine(args):
+    """`relay.py engine claude|codex [모델|default]` — 설정만 바꾼다. 데몬은 다음 리뷰부터 따른다."""
+    data = json.loads(CONFIG.read_text())
+    if not args:
+        print(f"엔진: {data.get('engine', 'claude')} · 모델: {data.get('model') or '각 CLI 기본값'}")
+        return
+    if args[0] not in ENGINES:
+        sys.exit(f"엔진은 {', '.join(ENGINES)} 중 하나입니다.")
+    if shutil.which(args[0]) is None:
+        sys.exit(f"{args[0]} CLI 를 찾을 수 없습니다 — 설치·로그인 후 다시 실행해 주세요.")
+    data["engine"] = args[0]
+    if len(args) > 1:
+        if args[1] == "default":
+            data.pop("model", None)
+        else:
+            data["model"] = args[1]
+    CONFIG.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    print(f"엔진: {data['engine']} · 모델: {data.get('model') or '각 CLI 기본값'} — 다음 리뷰부터 적용됩니다.")
+
+
 def main():
     (BASE / "logs").mkdir(exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
     if cmd == "run":
         serve()
+    elif cmd == "engine":
+        set_engine(sys.argv[2:])
     elif cmd == "requeue":
         requeue(force=tuple(sys.argv[2:]))
     elif cmd == "dry" and len(sys.argv) > 2 and PR_LINK.search(sys.argv[2]):

@@ -49,6 +49,9 @@ Claude 가 점검·설정·설치를 진행하고, 아래 세 가지만 직접 �
 - 저장소 폴더를 옮기거나 지우면 자동 업데이트가 멈춥니다. 옮긴 곳에서 `./install.sh` 를 다시 실행하면 됩니다.
 - 로그: `tail -f ~/.claude/slack-review/logs/relay.log`
 - 끄기: `launchctl bootout gui/$(id -u)/com.paynstore.slack-review`
+- 리뷰 엔진·모델: 기본은 Claude Code(내 기본 모델). Codex 로 바꾸거나 모델을 지정하려면
+  `~/.claude/slack-review/.venv/bin/python ~/.claude/slack-review/relay.py engine codex [모델]` (확인은 `… engine`, 되돌리기는 `… engine claude default`).
+  재시작 없이 다음 리뷰부터 적용됩니다. Codex 는 `codex login` 이 돼 있어야 하고, 지정한 모델이 내 계정에서 쓸 수 있는 것이어야 합니다.
 - 동시 리뷰: 기본 2개까지 동시에 돕니다(같은 PR 은 순서대로). 바꾸려면 설정에 `"workers": 3` 처럼 넣습니다.
 - 설정: `~/.claude/slack-review/config.json` (바꾼 뒤 `launchctl kickstart -k gui/$(id -u)/com.paynstore.slack-review`)
 

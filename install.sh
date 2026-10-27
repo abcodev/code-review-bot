@@ -29,7 +29,7 @@ has_key slack-review-user-token && ok "Slack 사용자 토큰 (키체인 slack-r
 
 echo "2) 파일 설치 → $DEST"
 mkdir -p "$DEST/logs"
-cp "$SRC"/{relay.py,prompt.md,schema.json,bb.py,posting.md} "$DEST/"
+cp "$SRC"/{relay.py,prompt.md,schema.json,schema.codex.json,bb.py,posting.md} "$DEST/"
 chmod +x "$DEST/bb.py"
 echo "$SRC" > "$DEST/source"   # 데몬이 30분마다 이 저장소의 새 커밋을 받아 스스로 업데이트한다
 if [ ! -f "$DEST/config.json" ]; then
