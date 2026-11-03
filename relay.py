@@ -58,7 +58,8 @@ DEFAULT_CHANNELS = ["C0C99HSN5RD"]   # 코드리뷰 채널 — 명령은 아무 
 NOT_CODE = re.compile(r"/test/|\.md$|^docs/")
 RE_REVIEW = re.compile(r"리뷰|\d+\s*차")  # 요청 스레드 안 상대방 답글에 「리뷰」가 있으면 다시 돈다(10-07)
 ROUND = re.compile(r"(\d+)\s*차")
-CANCEL_TEXT = re.compile(r"취소|중지")            # 재리뷰(「리뷰」)보다 먼저 본다 — 「리뷰 취소」는 취소다
+CANCEL_TEXT = re.compile(r"취소|중지")
+SLACK_LINK = re.compile(r"<[^>]*>|https?://\S+")   # 링크·멘션 덩어리 — 지우고 남는 말로 요청 여부를 본다            # 재리뷰(「리뷰」)보다 먼저 본다 — 「리뷰 취소」는 취소다
 CANCEL_REACTIONS = {"x", "heavy_multiplication_x", "negative_squared_cross_mark"}
 
 LIMIT = {"timeout": 90 * 60, "budget": "25"}
@@ -252,34 +253,52 @@ def partner_dms(slack, partners):
             return dms
 
 
-def new_requests(slack, state, me, partners, channel):
+def auto_request(text):
+    """코드리뷰 채널 본문 메시지가 리뷰 요청인가 — 링크만 있거나 「리뷰」라는 말과 함께일 때만. 「참고로 … 링크」는 아니다."""
+    if not PR_LINK.search(text):
+        return False
+    rest = re.sub(r"[\s\W_]+", "", SLACK_LINK.sub("", text))
+    return not rest or "리뷰" in text
+
+
+def new_requests(slack, state, me, partners, channel, auto=None):
     """이 DM 에 새로 올라온, 상대방이 남긴 요청. 처음 보는 DM 은 지금부터 읽는다 — 설치 전 요청은 건드리지 않는다."""
     with state.lock:
         oldest = state.cursor.setdefault(channel, f"{time.time():.6f}")
     messages = slack.conversations_history(channel=channel, oldest=oldest, limit=100)["messages"]
     found = []
     with state.lock:
-        found = _pick_requests(state, me, partners, channel, messages)
+        found = _pick_requests(state, me, partners, channel, messages, auto)
         state.save()
     return found
 
 
-def _pick_requests(state, me, partners, channel, messages):
+def _pick_requests(state, me, partners, channel, messages, auto=None):
+    """auto 는 링크만 보내도 되는 코드리뷰 채널의 저장소 목록 — 사람이 올린 본문 메시지도 요청으로 본다."""
     found = []
     for m in sorted(messages, key=lambda m: float(m["ts"])):
         state.cursor[channel] = max(state.cursor[channel], m["ts"], key=float)
-        requester = REQUESTER.match(m.get("text", ""))
-        if m.get("bot_id") != APP_BOT_ID or not requester:
+        text = m.get("text", "")
+        requester = REQUESTER.match(text)
+        if m.get("bot_id") == APP_BOT_ID and requester:
+            user = requester.group(1)
+            named = REVIEWERS.search(text)
+            named = MENTION.findall(named.group(1)) if named else []
+        elif auto and m.get("user") and not m.get("bot_id") and not m.get("subtype") and auto_request(text):
+            user = m["user"]
+            named = [u for u in MENTION.findall(text) if u != user]
+        else:
             continue
-        user = requester.group(1)
         mine = any(r["name"] == "eyes" and me in r.get("users", []) for r in m.get("reactions", []))
         if user == me or user not in partners or mine or m["ts"] in state.handled:
             continue
-        named = REVIEWERS.search(m["text"])
-        if named and me not in MENTION.findall(named.group(1)):
+        if named and me not in named:
             continue  # 리뷰어를 지정한 요청인데 내가 아니다
-        links = list(dict.fromkeys((r, int(i)) for r, i in PR_LINK.findall(m["text"])))
-        found.append((channel, m["ts"], links))
+        links = list(dict.fromkeys((r, int(i)) for r, i in PR_LINK.findall(text)))
+        if not requester:  # 사람이 올린 링크는 내 리뷰 대상 저장소만 — 다른 저장소 링크로 안내 답글이 달리지 않게
+            links = [link for link in links if link[0] in auto]
+        if links:
+            found.append((channel, m["ts"], links))
     return found
 
 
@@ -720,7 +739,8 @@ def serve():
                     dms, refreshed = partner_dms(slack, cfg["partners"]), time.time()
                 # 새 요청은 찾는 즉시 대기열에 넣는다 — 뒤 단계가 실패해도 읽은 위치만 넘어가고 요청이 사라지지 않게
                 enqueue([(c, ts, links, None, None) for channel in [*dms.values(), *cfg["channels"]]
-                         for c, ts, links in new_requests(slack, state, me, cfg["partners"], channel)])
+                         for c, ts, links in new_requests(slack, state, me, cfg["partners"], channel,
+                                                          cfg["repos"] if channel in cfg["channels"] else None)])
             except Exception:  # noqa: BLE001 — 일시적인 Slack 오류로 우편함 확인을 멈추지 않는다
                 log.exception("DM 확인 실패")
             try:
