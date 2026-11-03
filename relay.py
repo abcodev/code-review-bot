@@ -143,6 +143,15 @@ def load_config():
     return cfg
 
 
+def slack_client():
+    """한도(ratelimited)에 걸리면 Slack 이 알려 준 시간만큼 기다렸다 다시 부른다."""
+    from slack_sdk import WebClient
+    from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
+    client = WebClient(token=keychain("slack-review-user-token"))
+    client.retry_handlers.append(RateLimitErrorRetryHandler(max_retry_count=2))
+    return client
+
+
 def keychain(service):
     return subprocess.run(["security", "find-generic-password", "-s", service, "-w"],
                           capture_output=True, text=True, check=True).stdout.strip()
@@ -274,10 +283,35 @@ def _pick_requests(state, me, partners, channel, messages):
     return found
 
 
-def thread_requests(slack, state, me, partners):
-    """최근 요청 스레드 안의 답글 — (재리뷰 요청, 「취소」 가 달린 스레드)."""
-    found, cancels = [], []
+def active_threads(slack, state):
+    """스레드를 하나씩 열지 않고, 채널·DM 기록의 latest_reply 로 새 답글이 달린 스레드만 고른다.
+
+    스레드마다 conversations.replies 를 부르면 Slack 한도(앱 단위, 두 Mac 합산)에 걸려 새 요청까지 놓쳤다(11-03).
+    """
+    by_channel = {}
     for root, info in list(state.threads.items()):
+        by_channel.setdefault(info["channel"], []).append(root)
+    active = []
+    for channel, roots in by_channel.items():
+        cursor = None
+        while True:
+            page = slack.conversations_history(channel=channel, oldest=min(roots, key=float), inclusive=True,
+                                               limit=200, cursor=cursor)
+            for m in page["messages"]:
+                info = state.threads.get(m["ts"])
+                if info and float(m.get("latest_reply", 0)) > float(info["cursor"]):
+                    active.append(m["ts"])
+            cursor = page.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+    return active
+
+
+def thread_requests(slack, state, me, partners):
+    """새 답글이 달린 요청 스레드만 열어 본다 — (재리뷰 요청, 「취소」 가 달린 스레드)."""
+    found, cancels = [], []
+    for root in active_threads(slack, state):
+        info = state.threads[root]
         replies = slack.conversations_replies(channel=info["channel"], ts=root, oldest=info["cursor"])["messages"]
         with state.lock:
             picked, cancelled = _pick_rereviews(state, me, partners, root, info, replies)
@@ -634,7 +668,7 @@ def serve():
     from slack_sdk.socket_mode.response import SocketModeResponse
 
     cfg = load_config()
-    slack = WebClient(token=keychain("slack-review-user-token"))
+    slack = slack_client()
     me = slack.auth_test()["user_id"]
     state, jobs, queued = State(), queue.Queue(), set()
     active, active_lock = [0], threading.Lock()
@@ -671,17 +705,29 @@ def serve():
                 log.exception("자동 업데이트 실패")
 
     def poller():
+        def enqueue(found):
+            for job in found:
+                if job[1] not in queued:
+                    log.info("요청 발견 %s %s 스레드=%s 회차=%s", job[1], job[2], job[3], job[4])
+                    queued.add(job[1])
+                    state.add_pending(job)
+                    jobs.put(job)
+
         dms, refreshed, tick = {}, 0.0, 0
         while True:
             try:
                 if time.time() - refreshed > 600:
                     dms, refreshed = partner_dms(slack, cfg["partners"]), time.time()
-                found = [(c, ts, links, None, None) for channel in [*dms.values(), *cfg["channels"]]
-                         for c, ts, links in new_requests(slack, state, me, cfg["partners"], channel)]
+                # 새 요청은 찾는 즉시 대기열에 넣는다 — 뒤 단계가 실패해도 읽은 위치만 넘어가고 요청이 사라지지 않게
+                enqueue([(c, ts, links, None, None) for channel in [*dms.values(), *cfg["channels"]]
+                         for c, ts, links in new_requests(slack, state, me, cfg["partners"], channel)])
+            except Exception:  # noqa: BLE001 — 일시적인 Slack 오류로 우편함 확인을 멈추지 않는다
+                log.exception("DM 확인 실패")
+            try:
                 cancel_roots = []
                 if tick % THREAD_POLL_EVERY == 0:
                     rereviews, cancel_roots = thread_requests(slack, state, me, cfg["partners"])
-                    found += rereviews
+                    enqueue(rereviews)
                 tick += 1
                 allowed = set(cfg["partners"]) | {me}
                 for job in list(state.pending):
@@ -695,14 +741,8 @@ def serve():
                             slack.reactions_remove(channel=job[0], timestamp=job[1], name="eyes")
                         except Exception:  # noqa: BLE001 — 👀 가 아직 없으면 그만
                             pass
-                for job in found:
-                    if job[1] not in queued:
-                        log.info("요청 발견 %s %s 스레드=%s 회차=%s", job[1], job[2], job[3], job[4])
-                        queued.add(job[1])
-                        state.add_pending(job)
-                        jobs.put(job)
-            except Exception:  # noqa: BLE001 — 일시적인 Slack 오류로 우편함 확인을 멈추지 않는다
-                log.exception("DM 확인 실패")
+            except Exception:  # noqa: BLE001
+                log.exception("스레드·취소 확인 실패")
             time.sleep(POLL_SECONDS)
 
     def on_request(client, req):
@@ -743,7 +783,7 @@ def requeue(hours=24, force=()):
     from slack_sdk import WebClient
     cfg, state = load_config(), State()
     state.handled = [ts for ts in state.handled if ts not in force]
-    slack = WebClient(token=keychain("slack-review-user-token"))
+    slack = slack_client()
     me, pending = slack.auth_test()["user_id"], {job[1] for job in state.pending}
     for channel in [*partner_dms(slack, cfg["partners"]).values(), *cfg["channels"]]:
         history = slack.conversations_history(channel=channel, oldest=str(time.time() - hours * 3600), limit=200)
