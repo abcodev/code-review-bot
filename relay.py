@@ -58,8 +58,8 @@ DEFAULT_CHANNELS = ["C0C99HSN5RD"]   # 코드리뷰 채널 — 명령은 아무 
 NOT_CODE = re.compile(r"/test/|\.md$|^docs/")
 RE_REVIEW = re.compile(r"리뷰|\d+\s*차")  # 요청 스레드 안 상대방 답글에 「리뷰」가 있으면 다시 돈다(10-07)
 ROUND = re.compile(r"(\d+)\s*차")
-CANCEL_TEXT = re.compile(r"취소|중지")
-SLACK_LINK = re.compile(r"<[^>]*>|https?://\S+")   # 링크·멘션 덩어리 — 지우고 남는 말로 요청 여부를 본다            # 재리뷰(「리뷰」)보다 먼저 본다 — 「리뷰 취소」는 취소다
+CANCEL_TEXT = re.compile(r"취소|중지")            # 재리뷰(「리뷰」)보다 먼저 본다 — 「리뷰 취소」는 취소다
+SLACK_LINK = re.compile(r"<[^>]*>|https?://\S+")   # 링크·멘션 덩어리 — 지우고 남는 말로 요청 여부를 본다
 CANCEL_REACTIONS = {"x", "heavy_multiplication_x", "negative_squared_cross_mark"}
 
 LIMIT = {"timeout": 90 * 60, "budget": "25"}
@@ -253,12 +253,30 @@ def partner_dms(slack, partners):
             return dms
 
 
+def link_only(text):
+    return bool(PR_LINK.search(text)) and not re.sub(r"[\s\W_]+", "", SLACK_LINK.sub("", text))
+
+
 def auto_request(text):
     """코드리뷰 채널 본문 메시지가 리뷰 요청인가 — 링크만 있거나 「리뷰」라는 말과 함께일 때만. 「참고로 … 링크」는 아니다."""
-    if not PR_LINK.search(text):
-        return False
-    rest = re.sub(r"[\s\W_]+", "", SLACK_LINK.sub("", text))
-    return not rest or "리뷰" in text
+    return link_only(text) or (bool(PR_LINK.search(text)) and "리뷰" in text)
+
+
+def tidy_own_links(slack, me, channel, messages):
+    """내가 코드리뷰 채널에 링크만 올린 메시지를 `/코드리뷰` 요청과 같은 문구로 고친다.
+
+    내 토큰으로는 내 메시지만 고칠 수 있어 요청자 Mac 이 맡는다. 같은 메시지를 고치므로 상대 Mac 의 👀·처리 기록은 그대로다.
+    """
+    for m in messages:
+        text = m.get("text", "")
+        if m.get("user") != me or m.get("bot_id") or m.get("subtype") or not link_only(text):
+            continue
+        links = list(dict.fromkeys((r, int(i)) for r, i in PR_LINK.findall(text)))
+        reviewers = [u for u in dict.fromkeys(MENTION.findall(text)) if u != me]
+        try:
+            slack.chat_update(channel=channel, ts=m["ts"], text=request_text(me, links, reviewers))
+        except Exception:  # noqa: BLE001 — 문구만 못 바꿀 뿐 요청은 그대로 돈다
+            log.exception("링크 메시지 정리 실패 %s", m["ts"])
 
 
 def new_requests(slack, state, me, partners, channel, auto=None):
@@ -270,6 +288,8 @@ def new_requests(slack, state, me, partners, channel, auto=None):
     with state.lock:
         found = _pick_requests(state, me, partners, channel, messages, auto)
         state.save()
+    if auto:
+        tidy_own_links(slack, me, channel, messages)
     return found
 
 
