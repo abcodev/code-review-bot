@@ -76,7 +76,7 @@ Claude 가 점검·설정·설치를 진행하고, 아래 세 가지만 직접 �
 **1. 사전 점검** — 결과를 표로 보여 준다.
 ```bash
 claude auth status | grep -q '"loggedIn": true' && echo "Claude 로그인 OK"
-ssh -o BatchMode=yes -o ConnectTimeout=10 -T git@bitbucket.org 2>&1 | grep -qi authenticated && echo "Bitbucket SSH OK"
+ssh -o BatchMode=yes -o ConnectTimeout=10 -o HostKeyAlias=bitbucket.org -T git@ssh.bitbucket.org 2>&1 | grep -qi authenticated && echo "Bitbucket SSH OK"
 for s in bitbucket-api-token slack-review-app-token slack-review-user-token; do
   security find-generic-password -s "$s" >/dev/null 2>&1 && echo "$s 있음" || echo "$s 없음"; done
 ```

@@ -32,6 +32,10 @@ from pathlib import Path
 HOME = Path.home()
 BASE = HOME / ".claude/slack-review"
 REPO_ROOT = BASE / "repos"   # launchd 는 TCC 때문에 ~/Desktop 을 못 읽는다 — 봇 전용 클론을 둔다
+# Bitbucket 이 26-11-12 부터 SSH 를 ssh.bitbucket.org 로 옮긴다. 주소가 또 바뀌면 여기만 고치면 기존 클론도 다음 리뷰 때 따라온다.
+# 호스트 키는 bitbucket.org 와 같아서 이미 있는 known_hosts 항목으로 검증한다(install.sh 점검도 같은 방식).
+BB_SSH_HOST = "ssh.bitbucket.org"
+BB_SSH_COMMAND = "ssh -o HostKeyAlias=bitbucket.org"
 WT_ROOT = BASE / "wt"
 STATE = BASE / "state.json"
 CONFIG = BASE / "config.json"
@@ -426,10 +430,15 @@ def same_commit(a, b):
 # ── 워크트리 ────────────────────────────────────────────────
 
 def ensure_clone(repo):
-    repo_dir = REPO_ROOT / repo
+    repo_dir, url = REPO_ROOT / repo, f"git@{BB_SSH_HOST}:pay-n/{repo}.git"
     if not repo_dir.exists():
         REPO_ROOT.mkdir(exist_ok=True)
-        git(REPO_ROOT, "clone", "-q", f"git@bitbucket.org:pay-n/{repo}.git", repo)
+        git(REPO_ROOT, "-c", f"core.sshCommand={BB_SSH_COMMAND}", "clone", "-q",
+            "-c", f"core.sshCommand={BB_SSH_COMMAND}", url, repo)
+    elif git(repo_dir, "remote", "get-url", "origin").stdout.strip() != url:  # SSH 주소가 바뀌면 기존 클론도 옮긴다
+        git(repo_dir, "remote", "set-url", "origin", url)
+        git(repo_dir, "config", "core.sshCommand", BB_SSH_COMMAND)
+        log.info("Bitbucket 주소 변경 %s → %s", repo, url)
     return repo_dir
 
 

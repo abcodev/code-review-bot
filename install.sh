@@ -18,10 +18,11 @@ if command -v claude >/dev/null && claude auth status 2>/dev/null | grep -q '"lo
 else
   ng "Claude Code 로그인 필요 — 터미널에서 claude 실행 후 /login"
 fi
-if ssh -o BatchMode=yes -o ConnectTimeout=10 -T git@bitbucket.org 2>&1 | grep -qi "authenticated"; then
+# relay.py BB_SSH_HOST·BB_SSH_COMMAND 와 같은 주소·방식으로 본다
+if ssh -o BatchMode=yes -o ConnectTimeout=10 -o HostKeyAlias=bitbucket.org -T git@ssh.bitbucket.org 2>&1 | grep -qi "authenticated"; then
   ok "Bitbucket SSH 접근"
 else
-  ng "Bitbucket SSH 키 필요 — git@bitbucket.org 로 clone 이 되는지 확인"
+  ng "Bitbucket SSH 키 필요 — git@bitbucket.org 로 clone 이 되는지 확인 (처음이면 ssh -T git@bitbucket.org 로 호스트 키부터 등록)"
 fi
 has_key bitbucket-api-token    && ok "Bitbucket API 토큰 (키체인 bitbucket-api-token)" || ng "Bitbucket API 토큰 없음 — README 「토큰」 참고"
 has_key slack-review-app-token && ok "Slack 앱 토큰 (키체인 slack-review-app-token)"  || ng "Slack 앱 토큰 없음 — README 「토큰」 참고"
